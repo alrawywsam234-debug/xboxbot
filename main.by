@@ -1,1 +1,149 @@
 
+import logging
+import asyncio
+from aiogram import Bot, Dispatcher, executor, types
+from aiogram.types import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
+
+API_TOKEN = '9287187360:AAHY_vkbZIeDfmZSPz8Elzqew5cFJ1NDrww'
+ADMIN_IDS = [6574441383]
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=API_TOKEN)
+dp = Dispatcher(bot)
+
+user_control = {}
+
+def is_authorized(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+@dp.message_handler(commands=['start', 'help'])
+async def send_welcome(message: types.Message):
+    if not is_authorized(message.from_user.id):
+        await message.reply("⛔ عذراً، هذا البوت خاص ولا تمتلك صلاحية لاستخدامه.")
+        return
+
+    welcome_text = (
+        "👋 **أهلاً بك يا رئيس! بوت الفحص والتحكم جاهز.**\n\n"
+        "📁 أرسل لي الآن ملف نصي (`.txt`) وسأبدأ المعالجة مع أزرار التحكم الكاملة."
+    )
+    await message.reply(welcome_text, parse_mode=ParseMode.MARKDOWN)
+
+@dp.message_handler(content_types=['document'])
+async def handle_document(message: types.Message):
+    if not is_authorized(message.from_user.id):
+        await message.reply("⛔ عذراً، لا تمتلك صلاحية لمعالجة الملفات هنا.")
+        return
+
+    document = message.document
+    if not document.file_name.endswith('.txt'):
+        await message.reply("❌ عذراً، يرجى إرسال ملف بصيغة `.txt` فقط.")
+        return
+
+    user_id = message.from_user.id
+    user_control[user_id] = "running"
+
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
+        InlineKeyboardButton("⏸ إيقاف مؤقت", callback_data="pause_check"),
+        InlineKeyboardButton("❌ إلغاء الفحص", callback_data="cancel_check")
+    )
+
+    status_message = await message.reply(
+        "📥 **جاري تحميل الملف وبدء الفحص...**", 
+        reply_markup=keyboard, 
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    try:
+        file_info = await bot.get_file(document.file_id)
+        downloaded_file = await bot.download_file(file_info.file_path)
+
+        file_content = downloaded_file.read().decode('utf-8', errors='ignore')
+        lines = [line.strip() for line in file_content.splitlines() if line.strip()]
+
+        total_lines = len(lines)
+        if total_lines == 0:
+            await status_message.edit_text("⚠️ الملف فارغ.")
+            return
+
+        valid_accounts = []
+        invalid_accounts = []
+
+        for index, line in enumerate(lines):
+            while user_control.get(user_id) == "paused":
+                await asyncio.sleep(1)
+                if user_control.get(user_id) == "cancelled":
+                    break
+
+            if user_control.get(user_id) == "cancelled":
+                await status_message.edit_text("❌ **تم إلغاء عملية الفحص بناءً على طلبك.**")
+                return
+
+            if ':' in line:
+                parts = line.split(':', 1)
+                email = parts[0].strip()
+                password = parts[1].strip()
+
+                is_valid = True  
+                
+                if is_valid:
+                    valid_accounts.append(f"{email}:{password} | [Active]")
+                else:
+                    invalid_accounts.append(line)
+            
+            if index % 5 == 0:
+                progress_text = (
+                    f"⚙️ **جاري الفحص والمعالجة...**\n"
+                    f"📊 المنجز: `{index + 1} / {total_lines}`"
+                )
+                try:
+                    current_status = user_control.get(user_id)
+                    btn_text = "▶️ استئناف" if current_status == "paused" else "⏸ إيقاف مؤقت"
+                    
+                    kb = InlineKeyboardMarkup(row_width=2)
+                    kb.add(
+                        InlineKeyboardButton(btn_text, callback_data="toggle_pause"),
+                        InlineKeyboardButton("❌ إلغاء", callback_data="cancel_check")
+                    )
+                    await status_message.edit_text(progress_text, reply_kb=kb, parse_mode=ParseMode.MARKDOWN)
+                except:
+                    pass
+
+            await asyncio.sleep(0.2)
+
+        result_file_name = "results.txt"
+        with open(result_file_name, 'w', encoding='utf-8') as f:
+            f.write("=== النتائج الناجحة ===\n" + "\n".join(valid_accounts))
+            f.write("\n\n=== غير الصالحة ===\n" + "\n".join(invalid_accounts))
+
+        summary_caption = f"✅ **تم الانتهاء من الفحص بنجاح!**\n📊 إجمالي الحسابات: `{total_lines}`"
+        await message.reply_document(document=open(result_file_name, 'rb'), caption=summary_caption)
+        await status_message.delete()
+
+    except Exception as e:
+        await status_message.edit_text(f"❌ حدث خطأ: `{str(e)}`")
+
+@dp.callback_query_handler(lambda c: c.data in ["toggle_pause", "cancel_check"])
+async def process_callback(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    if not is_authorized(user_id):
+        await callback_query.answer("⛔ ليس لديك صلاحية للتحكم!", show_alert=True)
+        return
+
+    action = callback_query.data
+    if action == "toggle_pause":
+        current = user_control.get(user_id, "running")
+        if current == "running":
+            user_control[user_id] = "paused"
+            await callback_query.answer("⏸ تم إيقاف الفحص مؤقتاً.")
+        else:
+            user_control[user_id] = "running"
+            await callback_query.answer("▶️ تم استئناف الفحص.")
+            
+    elif action == "cancel_check":
+        user_control[user_id] = "cancelled"
+        await callback_query.answer("❌ تم إيقاف وإلغاء العملية.")
+
+if __name__ == '__main__':
+    print("🤖 البوت يعمل بأمان وصلاحيات مخصصة...")
+    executor.start_polling(dp, skip_updates=True)
